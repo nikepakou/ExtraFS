@@ -1,0 +1,508 @@
+近日有人求助，要写一个UNIX文件系统作为暑假作业。这种事情基本是学操作系统的必须要做的或者是做过的，毕竟文件系统是操作系统课程的一个重要组成部分。
+要实现这个UNIX文件系统，很多人就扎进了UNIX V6的的系统源码，以及《莱昂氏UNIX源代码分析》和《返璞归真:UNIX技术内幕》这两本书，很多人出来了，
+很多人在里面迷失了...最终忘了自己只是要实现一个UNIX文件系统而已。为何会迷失，因为代码不是自己写的，而且年代久远，编程理念不同了，
+作者为何那样写不一定就能理解，实际上对于任何别人写的代码，总是会有一些不易理解的地方，当然，如果作者水平超级高，那么代码也就相对容易理解。
+因此，写代码永远比读代码要容易！既然是要写一个文件系统，为何要用现成的UNIX V6代码呢？如果理解了UNIX文件的布局和结构，
+自己从零开始不参考任何现有的代码做一个也不是什么难事，最根本的是UNIX文件系统本身，至于说代码，仅仅是一个实现与用户操作的一个接口而已
+。如果代码是自己一点一点写的，那么你肯定能彻底明白每一行的每一个语句的精确含义，至于为何这么写，你当然及其明了！
+
+本文留下我仓促间几个小时写的一个类UNIX文件系统的代码，不是让别人看的，是为了自己留档，因为本文已经说了，
+看别人的代吗只能学习经验，不能理解本质，更何况，你看的还得是超级一流的代码，而我写的，则是超级垃圾的代码。
+我只想说，理解问题的本质要比代码重要得多，代码并不是很多人想象中的那般重要！
+本文的实现基于Linux系统，即在Linux系统上编写一个用户态程序，实现UNIX文件的IO接口以及操作。
+
+我一向坚持的原则，那就是任何东西的根本性的，本质上的原理以及背后的思想都是及其简单的，
+所谓的复杂性都是优化与策略化的扩展带来的，正如TCP一样，UNIX的文件系统也不例外！我们必须知道，什么是最根本的，
+什么是次要的。对于UNIX文件系统，最根本的就是其布局以及其系统调用接口，一个处在最低层，一个在最上层开放给用户，
+如下所示：
+
+系统调用接口：open，write，read，close...
+
+文件系统布局：引导快，超级块，inode区表，数据块区
+
+所有的在二者中间的部分都是次要的，也就是说那些东西不要也行，比如高速缓冲，高速缓存，VFS层，
+块层...因此在我的实现代码中，并没有这些东西，我所做到的，仅仅是UNIX文件系统所要求必须做到的最小集，那就是：
+
+面对一个按照UNIX文件系统标准布局的“块设备”，可以使用open，read，write等接口进行IO操作。
+
+在实现中，我用一个标准的Linux大文件来模拟磁盘块，这样块的操作基本都映射到了Linux标准的write，read等系统调用了。
+
+首先定义必要的结构体：
+
+//超级块结构
+struct filesys {
+        unsigned int s_size;        //总大小                                          
+        unsigned int s_itsize;        //inode表大小                                        
+        unsigned int s_freeinodesize;    //空闲i节点的数量                          
+        unsigned int s_nextfreeinode;    //下一个空闲i节点
+        unsigned int s_freeinode[NUM];    //空闲i节点数组
+        unsigned int s_freeblocksize;    //空闲块的数量          
+        unsigned int s_nextfreeblock;    //下一个空闲块
+        unsigned int s_freeblock[NUM];    //空闲块数组
+        unsigned int s_pad[];        //填充到512字节  
+};
+//磁盘inode结构
+struct finode {
+        int fi_mode;            //类型：文件/目录
+        int fi_uid_unused;        //uid，由于和进程无关联，仅仅是模拟一个FS，未使用，下同
+        int fi_gid_unused;
+        int fi_nlink;            //链接数，当链接数为0，意味着被删除
+        long int fi_size;        //文件大小
+        long int fi_addr[BNUM];        //文件块一级指针，并未实现多级指针
+        time_t  fi_atime_unused;    //未实现
+        time_t  fi_mtime_unused;
+};
+//内存inode结构
+struct inode {
+        struct finode  i_finode;
+        struct inode    *i_parent;    //所属的目录i节点
+        int    i_ino;            //i节点号
+        int    i_users;        //引用计数
+};
+//目录项结构(非Linux内核的目录项)
+struct direct
+{
+        char d_name[MAXLEN];        //文件或者目录的名字
+        unsigned short d_ino;        //文件或者目录的i节点号
+};
+//目录结构
+struct dir
+{
+        struct direct direct[DIRNUM];    //包含的目录项数组
+        unsigned short size;        //包含的目录项大小    
+};
+//抽象的文件结构
+struct file {
+        struct inode *f_inode;        //文件的i节点
+        int f_curpos;            //文件的当前读写指针
+};
+
+之所以叫做类UNIX文件系统，是因为我并没有去精确确认当时的UNIX文件系统的超级块以及inode表的结构，只是大致的模仿其布局，比如超级块中字段，以及字段的顺序可能和标准的UNIX文件系统并不完全一致。但是不管怎么说，当时的UNIX文件系统基本就是这个一个样子。另外，可以看到file结构体内容及其少，因为本质上，我只是想表示“一个inode节点相对于一个读写者来说，就是一个file”，仅此而已。接下来就是具体的实现了，我的方式是自下而上的，这样做的好处在于便于今后的扩展。那么首先要完成的就是i节点的分配和释放了，我的实现中，是将文件i节点映射到了内存i节点，这样或许违背了我的初衷，我不是说过不要那么多“额外”的东西来扰乱视听的吗？是的，然而比起那些所谓的额外的优化，我更不喜欢频繁的调用read和write。反正，只要自己能控制住局面即可。
+
+在实现中，还有一个大事就是内存的分配与释放，这些也不是本质的，记住，要实现的仅仅是一个UNIX文件系统，其它的能绕开则绕开！显然malloc，free等也是我们要绕开的，于是我基本都使用预分配空间的东西-全局数组。以下是全局变量：
+
+//内存i节点数组，NUM为该文件系统容纳的文件数
+struct inode g_usedinode[NUM];
+//ROOT的内存i节点
+struct inode *g_root;
+//已经打开文件的数组
+struct file* g_opened[OPENNUM];
+//超级块
+struct filesys *g_super;
+//模拟二级文件系统的Linux大文件的文件描述符
+int g_fake_disk = -1;
+
+在给出实现代码之前，要说明的是，在删除文件的时候，我并没有实现文件块区以及i节点的清除操作，众所周知，那样很耗时很多实现一样，我只是记录了一些信息，表示这个文件块或者inode字段是可以随时覆盖的。
+//同步i节点，将其写入“磁盘”
+void syncinode(struct inode *inode)
+{
+        int ino = -1, ipos = -1;
+        ino = inode->i_ino;
+    //ipos为inode节点表在文件系统块中的偏移
+        ipos = IBPOS + ino*sizeof(struct finode);
+    //从模拟块的指定偏移位置读取inode信息
+        lseek(g_fake_disk, ipos, SEEK_SET);
+        write(g_fake_disk, (void *)&inode->i_finode, sizeof(struct finode));
+}
+
+//同步超级块信息
+int syncsuper(struct filesys *super)
+{
+        int pos = -1, size = -1;
+        struct dir dir = {0};
+        pos = BOOTBSIZE;
+        size = SUPERBSIZE;
+        lseek(g_fake_disk, pos, SEEK_SET);
+        write(g_fake_disk, (void *)super, size);
+        syncinode(g_root);
+        breadwrite(g_root->i_finode.fi_addr[0], (char *)&dir, sizeof(struct dir), 0, 1);
+        breadwrite(g_root->i_finode.fi_addr[0], (char *)&dir, sizeof(struct dir), 0, 0);
+}
+//关键的将路径名转换为i节点的函数，暂不支持相对路径
+struct inode *namei(char *filepath, char flag, int *match, char *ret_name)
+{
+        int in = 0;
+        int repeat = 0;
+        char *name = NULL;
+        char *path = calloc(1, MAXLEN*10);
+        char *back = path;
+
+        struct inode *root = iget(0);
+        struct inode *parent = root;
+        struct dir dir = {0};
+        strncpy(path, filepath, MAXLEN*10);
+        if (path[0] != '/')
+                return NULL;
+        breadwrite(root->i_finode.fi_addr[0], &dir, sizeof(struct dir), 0, 1);
+        while((name=strtok(path, "/")) != NULL) {
+                int i = 0;
+                repeat = 0;
+                *match = 0;
+                path = NULL;
+                if (ret_name) {
+                        strcpy(ret_name, name);
+                }
+                for (; i<dir.size; i++) {
+                        if (!strncmp(name, dir.direct[i].d_name, strlen(name))) {
+                                parent = root;
+                                iput(root);
+                                root = iget(dir.direct[i].d_ino);
+                                root->i_parent = parent;
+                                *match = 1;
+                                if (root->i_finode.fi_mode == MODE_DIR) {
+                                        memset(&dir, 0, sizeof(struct dir));
+                                        breadwrite(root->i_finode.fi_addr[0], &dir, sizeof(struct dir), 0, 1);
+                                } else {
+                                        free(back);
+                                        return root;
+                                }
+                                repeat = 1;
+                        }
+                }
+                if (repeat == 0) {
+                        break;
+                }
+        }
+        if (*match != 1) {
+                *match = 0;
+        }
+        if (*match == 0) {
+                if (ret_name) {
+                        strcpy(ret_name, name);
+                }
+        }
+        free(back);
+        return root;
+}
+//通过i节点号获取内存i节点的函数
+struct inode *iget(int ino)
+{
+        int ibpos = 0;
+        int ipos = 0;
+        int ret = 0;
+    //倾向于直接从内存i节点获取
+        if (g_usedinode[ino].i_users) {
+                g_usedinode[ino].i_users ++;
+                return &g_usedinode[ino];
+        }
+        if (g_fake_disk < 0) {
+                return NULL;
+        }
+    //实在不行则从模拟磁盘块读入
+        ipos = IBPOS + ino*sizeof(struct finode);
+        lseek(g_fake_disk, ipos, SEEK_SET);
+        ret = read(g_fake_disk, &g_usedinode[ino], sizeof(struct finode));
+        if (ret == -1) {
+                return NULL;
+        }
+        if (g_super->s_freeinode[ino] == 0) {
+                return NULL;
+        }
+    //如果是一个已经被删除的文件或者从未被分配过的i节点，则初始化其link值以及size值
+        if (g_usedinode[ino].i_finode.fi_nlink == 0) {
+                g_usedinode[ino].i_finode.fi_nlink ++;
+                g_usedinode[ino].i_finode.fi_size = 0;
+                syncinode(&g_usedinode[ino]);
+        }
+        g_usedinode[ino].i_users ++;
+        g_usedinode[ino].i_ino = ino;
+        return &g_usedinode[ino];
+
+}
+//释放一个占有的内存i节点
+void iput(struct inode *ip)
+{
+        if (ip->i_users > 0)
+                ip->i_users --;
+}
+//分配一个未使用的i节点。注意，我并没有使用超级块的s_freeinodesize字段，
+//因为还会有一个更好更快的分配算法
+struct inode* ialloc()
+{
+        int ino = -1, nowpos = -1;
+        ino = g_super->s_nextfreeinode;
+        if (ino == -1) {
+                return NULL;
+        }
+        nowpos = ino + 1;
+        g_super->s_nextfreeinode = -1;
+    //寻找下一个空闲i节点，正如上述，这个算法并不好
+        for (; nowpos < NUM; nowpos++) {
+                if (g_super->s_freeinode[nowpos] == 0) {
+                        g_super->s_nextfreeinode = nowpos;
+                        break;
+                }
+        }
+        g_super->s_freeinode[ino] = 1;
+        return iget(ino);
+}
+//试图删除一个文件i节点
+int itrunc(struct inode *ip)
+{
+        iput(ip);
+        if (ip->i_users == 0 && g_super) {
+                syncinode(ip);
+                g_super->s_freeinode[ip->i_ino] = 0;
+                g_super->s_nextfreeinode = ip->i_ino;
+                return 0;
+        }
+        return ERR_BUSY;
+}
+//分配一个未使用的磁盘块
+int balloc()
+{
+        int bno = -1, nowpos = -1;
+        bno = g_super->s_nextfreeblock;
+        if (bno == -1) {
+                return bno;
+        }
+        nowpos = bno + 1;
+        g_super->s_nextfreeblock = -1;
+        for (; nowpos < NUM; nowpos++) {
+                if (g_super->s_freeblock[nowpos] == 0) {
+                        g_super->s_nextfreeblock = nowpos;
+                        break;
+                }
+        }
+        g_super->s_freeblock[bno] = 1;
+        return bno;
+}
+//读写操作
+int breadwrite(int bno, char *buf, int size, int offset, int type)
+{
+        int pos = BOOTBSIZE+SUPERBSIZE+g_super->s_itsize + bno*BSIZE;
+        int rs = -1;
+        if (offset + size > BSIZE) {
+                return ERR_EXCEED;
+        }
+        lseek(g_fake_disk, pos + offset, SEEK_SET);
+        rs = type ? read(g_fake_disk, buf, size):write(g_fake_disk, buf, size);
+        return rs;
+}
+//IO读接口
+int mfread(int fd, char *buf, int length)
+{
+        struct file *fs = g_opened[fd];
+        struct inode *inode = fs->f_inode;
+        int baddr = fs->f_curpos;
+        int bondary = baddr%BSIZE;
+        int max_block = (baddr+length)/BSIZE;
+        int size = 0;
+        int i = inode->i_finode.fi_addr[baddr/BSIZE+1];
+        for (; i < max_block+1; i ++,bondary = size%BSIZE) {
+                size += breadwrite(inode->i_finode.fi_addr[i], buf+size, (length-size)%BSIZE, bondary, 1);
+        }
+        return size;
+}
+//IO写接口
+int mfwrite(int fd, char *buf, int length)
+{
+        struct file *fs = g_opened[fd];
+        struct inode *inode = fs->f_inode;
+        int baddr = fs->f_curpos;
+        int bondary = baddr%BSIZE;
+        int max_block = (baddr+length)/BSIZE;
+        int curr_blocks = inode->i_finode.fi_size/BSIZE;
+        int size = 0;
+        int sync = 0;
+        int i = inode->i_finode.fi_addr[baddr/BSIZE+1];
+    //如果第一次写，先分配一个块
+        if (inode->i_finode.fi_size == 0) {
+        int nbno = balloc();
+                if (nbno == -1) {
+                        return -1;
+                }
+                inode->i_finode.fi_addr[0] = nbno;
+                sync = 1;
+        }
+    //如果必须扩展，则再分配块，可以和上面的合并优化
+        if (max_block > curr_blocks) {
+                int j = curr_blocks + 1;
+                for (; j < max_block; j++) {
+            int nbno = balloc();
+                    if (nbno == -1) {
+                            return -1;
+                    }
+                        inode->i_finode.fi_addr[j] = nbno;
+                }
+                sync = 1;
+        }
+        for (; i < max_block+1; i ++,bondary = size%BSIZE) {
+                size += breadwrite(inode->i_finode.fi_addr[i], buf+size, (length-size)%BSIZE, bondary, 0);
+        }
+        if (size) {
+                inode->i_finode.fi_size += size;
+                sync = 1;
+        }
+        if (sync) {
+                syncinode(inode);
+        }
+        return size;
+}
+//IO的seek接口
+int mflseek(int fd, int pos)
+{
+        struct file *fs = g_opened[fd];
+        fs->f_curpos = pos;
+        return pos;
+}
+//IO打开接口
+int mfopen(char *path, int mode)
+{
+        struct inode *inode = NULL;
+        struct file *file = NULL;
+        int match = 0;
+        inode = namei(path, 0, &match, NULL);
+        if (match == 0) {
+                return ERR_NOEXIST;
+        }
+        file = (struct file*)calloc(1, sizeof(struct file));
+        file->f_inode = inode;
+        file->f_curpos = 0;
+        g_opened[g_fd] = file;
+        g_fd++;
+        return g_fd-1;
+}
+//IO关闭接口
+void mfclose(int fd)
+{
+        struct inode *inode = NULL;
+        struct file *file = NULL;
+        file = g_opened[fd];
+        inode = file->f_inode;
+        iput(inode);
+        free(file);
+}
+//IO创建接口
+int mfcreat(char *path, int mode)
+{
+        int match = 0;
+        struct dir dir;
+        struct inode *new = NULL;
+        char name[MAXLEN] = {0};;
+        struct inode *inode = namei(path, 0, &match, name);
+        if (match == 1) {
+                return ERR_EXIST;
+        }
+        breadwrite(inode->i_finode.fi_addr[0], (char *)&dir, sizeof(struct dir), 0, 1);
+        strcpy(dir.direct[dir.size].d_name, name);
+        new = ialloc();
+        if (new == NULL) {
+                return -1;
+        }
+        dir.direct[dir.size].d_ino = new->i_ino;
+        new->i_finode.fi_mode = mode;
+        if (mode == MODE_DIR) {
+        //不允许延迟分配目录项
+                int nbno = balloc();
+                if (nbno == -1) {
+                        return -1;
+                }
+                new->i_finode.fi_addr[0] = nbno;
+        }
+        new->i_parent = inode;
+        syncinode(new);
+        dir.size ++;
+        breadwrite(inode->i_finode.fi_addr[0], (char *)&dir, sizeof(struct dir), 0, 0);
+        syncinode(inode);
+        iput(inode);
+        syncinode(new);
+        iput(new);
+        return ERR_OK;
+}
+//IO删除接口
+int mfdelete(char *path)
+{
+        int match = 0;
+        struct dir dir;
+        struct inode *del = NULL;
+        struct inode *parent = NULL;
+        char name[MAXLEN];
+        int i = 0;
+        struct inode *inode = namei(path, 0, &match, name);
+        if (match == 0 || inode->i_ino == 0) {
+                return ERR_NOEXIST;
+        }
+        match = -1;
+        parent = inode->i_parent;
+        breadwrite(parent->i_finode.fi_addr[0], (char *)&dir, sizeof(struct dir), 0, 1);
+        for (; i < dir.size; i++) {
+                if (!strncmp(name, dir.direct[i].d_name, strlen(name))) {
+                        del = iget(dir.direct[i].d_ino);
+                        iput(del);
+                        if (itrunc(del) == 0) {
+                                memset(dir.direct[i].d_name, 0, strlen(dir.direct[i].d_name));
+                                match = i;
+                                break;
+                        } else {
+                                return ERR_BUSY;
+                        }
+                }
+        }
+        for (i = match; i < dir.size - 1 && match != -1; i++) {
+                strcpy(dir.direct[i].d_name, dir.direct[i+1].d_name);
+        }
+        dir.size--;
+        breadwrite(parent->i_finode.fi_addr[0], (char *)&dir, sizeof(struct dir), 0, 0);
+        return ERR_OK;
+}
+
+//序列初始化接口，从模拟块设备初始化内存结构
+int initialize(char *fake_disk_path)
+{
+        g_fake_disk = open(fake_disk_path, O_RDWR);
+        if (g_fake_disk == -1) {
+                return ERR_NOEXIST;
+        }
+        g_super = (struct filesys*)calloc(1, sizeof(struct filesys));
+        lseek(g_fake_disk, BOOTBSIZE, SEEK_SET);
+        read(g_fake_disk, g_super, sizeof(struct filesys));
+        g_super->s_size = 1024*1024;
+        g_super->s_itsize = INODEBSIZE;
+        g_super->s_freeinodesize = NUM;
+        g_super->s_freeblocksize = (g_super->s_size - (BOOTBSIZE+SUPERBSIZE+INODEBSIZE))/BSIZE;
+        g_root =  iget(0);
+    //第一次的话要分配ROOT
+        if (g_root == NULL) {
+                g_root = ialloc();
+                g_root->i_finode.fi_addr[0] = balloc();
+        }
+        return ERR_OK;
+}
+下面是一个测试程序：
+int main()
+{
+        int fd = -1,ws = -1;
+        char buf[16] = {0};
+        initialize("bigdisk");
+        mfcreat("/aa", MODE_FILE);
+        fd = mfopen("/aa", 0);
+        ws = mfwrite(fd, "abcde", 5);
+        mfread(fd, buf, 5);
+        mfcreat("/bb", MODE_DIR);
+        mfcreat("/bb/cc", MODE_FILE);
+        fd = mfopen("/bb/cc", 0);
+        ws = mfwrite(fd, "ABCDEFG", 6);
+        mfread(fd, buf, 5);
+        mflseek(0, 4);
+        ws = mfwrite(0, "ABCDEFG", 6);
+        mflseek(0, 0);
+        mfread(0, buf, 10);
+        mfclose(0);
+        mfdelete("/aa");
+        fd = mfopen("/aa", 0);
+        mfcreat("/aa", MODE_FILE);
+        fd = mfopen("/aa", 0);
+        syncsuper(g_super);
+}
+
+这个文件系统实现得超级简单，除去了很多额外的非本质的东西，并且也绕开了烦人的内存管理问题！
+于是，我的这个实现也就显示了UNIX文件系统的本质。那么再看一下，还有什么东西虽然是额外的，
+但是却是必不可少或者起码说是很有意思的？答案很显然，那就是空闲块或者空闲inode的组织以及分配算法，
+然而这个算法可以单独抽象出来。
+
+推荐阅读：
+
+UNIX/Linux 系统管理技术手册(第四版)高清中文PDF 下载：http://www.linuxidc.com/Linux/2013-07/86757.htm
+
+UNIX/Linux 系统管理技术手册(第四版)高清英文PDF 下载见 http://www.linuxidc.com/Linux/2013-07/86756.htm
